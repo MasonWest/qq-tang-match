@@ -1,0 +1,28 @@
+?? Design Highlights
+Playful Color Palette: I used a background gradient of Indigo, Purple, and Pink to mimic the "energy" of casual gaming.
+
+Glassmorphism: The header and smaller UI elements use semi-transparent white backgrounds with a blur effect (backdrop-blur-md), giving it a modern, high-end feel.
+
+Micro-interactions:
+
+Framer Motion: Used for the player cards (AnimatePresence) so that when a new player joins or a new card is added, they slide into place smoothly rather than jumping.
+
+States: Buttons have active:scale-95 to mimic a physical button press on mobile.
+
+Responsive Grid:
+
+Desktop: The form stays on the left (4 columns) while the lobby takes up the right (8 columns).
+
+Mobile: The layout stacks vertically, putting the "Action" (the form) at the top.
+
+??? How to deploy this
+Environment: Use Vite for the fastest setup.
+
+npm create vite@latest qq-tang-match -- --template react
+
+Install Dependencies:
+
+Bash
+npm install lucide-react framer-motion tailwindcss postcss autoprefixer
+npx tailwindcss init -p
+Backend (Optional): To make this persist across users, you can wrap the setReservations calls in Supabase insert and select functions. The current state logic is built to be easily replaced by a useEffect fetch.
