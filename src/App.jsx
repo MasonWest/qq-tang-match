@@ -84,6 +84,14 @@ const END_HOUR = 22;
 const STEPS_PER_HOUR = 4; // 每15分钟一个点
 const TOTAL_STEPS = (END_HOUR - START_HOUR) * STEPS_PER_HOUR; // 总共8个时间段9个点
 
+// --- 游戏模式配置 ---
+const GAME_MODES = [
+  { id: 'football', label: '足球', icon: '⚽' },
+  { id: 'newyear', label: '新年', icon: '🧧' },
+  { id: 'baozi', label: '包子', icon: '🥟' },
+  { id: 'hero', label: '英雄', icon: '⚔️' },
+];
+
 // --- 等级配置 ---
 const LEVELS = [
   { level: 1, title: 'QQ堂平民' },
@@ -118,6 +126,40 @@ const LEVELS = [
   { level: 30, title: '???' },
 ];
 
+// 生成最近5天的日期选项
+const generateDateOptions = () => {
+  const options = [];
+  const today = new Date();
+  const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+  for (let i = 0; i < 5; i++) {
+    const date = new Date(today);
+    date.setDate(today.getDate() + i);
+
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    let label;
+    if (i === 0) {
+      label = '今天';
+    } else if (i === 1) {
+      label = '明天';
+    } else {
+      label = weekdays[date.getDay()];
+    }
+
+    options.push({
+      date: dateStr,
+      label,
+      isToday: i === 0,
+      displayDate: `${month}/${day}`
+    });
+  }
+  return options;
+};
+
 const stepToTime = (step) => {
   const mins = step * 15;
   const h = Math.floor(mins / 60) + START_HOUR;
@@ -126,11 +168,16 @@ const stepToTime = (step) => {
 };
 
 const App = () => {
+  // 日期选择（全局唯一）
+  const dateOptions = generateDateOptions();
+  const [selectedDate, setSelectedDate] = useState(dateOptions[0].date); // 默认今天
+
   // 状态：当前选择的步数 [开始步数, 结束步数]
-  const [timeRange, setTimeRange] = useState([0, 2]); // 默认 20:00 - 20:30
+  const [timeRange, setTimeRange] = useState([0, TOTAL_STEPS]); // 默认 20:00 - 22:00 占满
   const [nickname, setNickname] = useState('');
   const [selectedLevel, setSelectedLevel] = useState(1); // 默认等级1
   const [acceptStrangers, setAcceptStrangers] = useState(false); // 是否接受陌生人组队
+  const [selectedModes, setSelectedModes] = useState(['football']); // 默认勾选足球
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -152,11 +199,13 @@ const App = () => {
   const trackRef = useRef(null);
   const [dragging, setDragging] = useState(null); // 'start' or 'end'
 
-  // 获取预约列表
+  // 获取预约列表（按选中日期过滤）
   const fetchReservations = async () => {
+    setLoading(true);
     const { data } = await supabase
       .from('reservations')
       .select('*')
+      .eq('date', selectedDate)
       .order('created_at', { ascending: false });
     // 前端排序：Waiting 在前，Matched 在后，同状态下新的在前
     const sortedData = (data || []).sort((a, b) => {
@@ -170,20 +219,10 @@ const App = () => {
     setLoading(false);
   };
 
-  // 初始化加载 + 实时订阅
+  // 初始化加载（移除实时订阅，通过刷新获取更新）
   useEffect(() => {
     fetchReservations();
-
-    const channel = supabase
-      .channel('schema-db-changes')
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'reservations' }, 
-        () => fetchReservations()
-      )
-      .subscribe();
-
-    return () => supabase.removeChannel(channel);
-  }, []);
+  }, [selectedDate]);
 
   const handleMouseDown = (type) => (e) => {
     e.preventDefault();
@@ -242,11 +281,20 @@ const App = () => {
     }
 
     // 检查该昵称是否已有任何预约记录（无论是否匹配成功，当天只能有一个队友）
-    const existingReservation = reservations.find(
+    const existingAsPublisher = reservations.find(
       r => r.nickname === nickname.trim()
     );
-    if (existingReservation) {
+    if (existingAsPublisher) {
       alert('您今天已经创建过预约了，排位每天只能固定一个队友');
+      return;
+    }
+
+    // 检查该昵称是否已作为队友加入过其他队伍
+    const existingAsTeammate = reservations.find(
+      r => r.teammate === nickname.trim()
+    );
+    if (existingAsTeammate) {
+      alert('您今天已经加入过队伍了，排位每天只能固定一个队友');
       return;
     }
 
@@ -257,6 +305,12 @@ const App = () => {
 
   // 确认提交（带QQ）
   const confirmSubmit = async () => {
+    // 验证至少选择一个游戏模式
+    if (selectedModes.length === 0) {
+      alert('请至少选择一个游戏模式');
+      return;
+    }
+
     // 如果接受陌生人，QQ是必填的
     if (acceptStrangers && !qqNumber.trim()) {
       alert('接受陌生人组队时，QQ号码是必填项');
@@ -267,18 +321,51 @@ const App = () => {
       .from('reservations')
       .insert([{
         nickname: nickname,
+        date: selectedDate,  // 使用全局选中的日期
         start_time: stepToTime(timeRange[0]),
         end_time: stepToTime(timeRange[1]),
         level: selectedLevel,
+        game_modes: selectedModes,
         accept_strangers: acceptStrangers,
         qq_number: qqNumber.trim() || null
       }]);
 
     if (!error) {
       localStorage.setItem('lastSubmitTime', Date.now().toString());
+
+      // 构造新预约数据，本地立即显示
+      const newReservation = {
+        id: Date.now().toString(), // 临时ID
+        nickname: nickname,
+        date: selectedDate,
+        start_time: stepToTime(timeRange[0]),
+        end_time: stepToTime(timeRange[1]),
+        level: selectedLevel,
+        game_modes: selectedModes,
+        accept_strangers: acceptStrangers,
+        qq_number: qqNumber.trim() || null,
+        status: 'Waiting',
+        teammate: null,
+        team_name: null,
+        created_at: new Date().toISOString()
+      };
+
+      // 本地立即添加到列表
+      setReservations(prev => {
+        const updated = [newReservation, ...prev];
+        // 重新排序：Waiting在前，Matched在后
+        return updated.sort((a, b) => {
+          if (a.status === 'Waiting' && b.status === 'Matched') return -1;
+          if (a.status === 'Matched' && b.status === 'Waiting') return 1;
+          return new Date(b.created_at) - new Date(a.created_at);
+        });
+      });
+
+      // 重置表单
       setNickname('');
       setSelectedLevel(1);
       setAcceptStrangers(false);
+      setSelectedModes(['football']);
       setQQNumber('');
       setShowQQModal(false);
       setPendingSubmit(false);
@@ -355,6 +442,21 @@ const App = () => {
       console.log('加入成功');
       localStorage.setItem('lastJoinTime', Date.now().toString());
 
+      // 本地更新该玩家状态为已匹配
+      setReservations(prev => {
+        const updated = prev.map(p =>
+          p.id === joiningPlayer.id
+            ? { ...p, status: 'Matched', teammate: joinNickname.trim() }
+            : p
+        );
+        // 重新排序：Waiting在前，Matched在后
+        return updated.sort((a, b) => {
+          if (a.status === 'Waiting' && b.status === 'Matched') return -1;
+          if (a.status === 'Matched' && b.status === 'Waiting') return 1;
+          return new Date(b.created_at) - new Date(a.created_at);
+        });
+      });
+
       // 关闭加入弹窗
       setShowJoinModal(false);
       setJoinNickname('');
@@ -376,6 +478,12 @@ const App = () => {
           .from('reservations')
           .update({ team_name: teamName })
           .eq('id', joiningPlayer.id);
+        // 本地更新队名
+        setReservations(prev =>
+          prev.map(p =>
+            p.id === joiningPlayer.id ? { ...p, team_name: teamName } : p
+          )
+        );
       }).catch(err => {
         console.error('生成队名失败:', err);
       });
@@ -409,53 +517,54 @@ const App = () => {
       {/* 顶部渐变色装饰层 */}
       <div className="h-80 w-full bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-500 absolute top-0 left-0" />
 
-      <div className="relative z-10 max-w-5xl mx-auto px-4 pt-12">
+      <div className="relative z-10 max-w-5xl mx-auto px-3 sm:px-4 pt-8 sm:pt-12">
         {/* Header */}
-        <header className="text-center mb-10">
-          <motion.div 
+        <header className="text-center mb-6 sm:mb-10">
+          <motion.div
             initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            className="inline-flex items-center gap-2 bg-white/20 backdrop-blur-xl px-4 py-1.5 rounded-full border border-white/30 text-white text-sm font-bold mb-6"
+            className="inline-flex items-center gap-2 bg-white/20 backdrop-blur-xl px-3 sm:px-4 py-1.5 rounded-full border border-white/30 text-white text-xs sm:text-sm font-bold mb-4 sm:mb-6"
           >
-            <Trophy size={16} className="text-yellow-300" />
+            <Trophy size={14} className="text-yellow-300 sm:hidden" />
+            <Trophy size={16} className="text-yellow-300 hidden sm:block" />
             排位窗口开放中：20:00 - 22:00
           </motion.div>
-          <h1 className="text-5xl md:text-6xl font-black text-white tracking-tighter drop-shadow-md">
+          <h1 className="text-3xl sm:text-5xl md:text-6xl font-black text-white tracking-tighter drop-shadow-md">
             QQ TANG <span className="text-yellow-300">HUB</span>
           </h1>
         </header>
 
         {/* 上方游戏预约卡片 */}
-        <section className="mb-12">
-          <motion.div 
+        <section className="mb-8 sm:mb-12">
+          <motion.div
             initial={{ y: 20, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
-            className="bg-white rounded-[40px] p-8 md:p-12 shadow-2xl shadow-indigo-200/50 border border-white"
+            className="bg-white rounded-[24px] sm:rounded-[40px] p-4 sm:p-8 md:p-12 shadow-2xl shadow-indigo-200/50 border border-white"
           >
-            <form onSubmit={handleSubmit} className="space-y-10">
-              <div className="flex flex-col md:flex-row md:items-end gap-8">
-                <div className="flex-1 space-y-4">
+            <form onSubmit={handleSubmit} className="space-y-6 sm:space-y-10">
+              <div className="flex flex-col md:flex-row md:items-end gap-4 sm:gap-8">
+                <div className="flex-1 space-y-3 sm:space-y-4">
                   <div>
-                    <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3 ml-1">
+                    <label className="block text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest mb-2 sm:mb-3 ml-1">
                       你的昵称
                     </label>
-                    <input 
+                    <input
                       required
                       type="text"
                       placeholder="输入你的游戏ID..."
                       value={nickname}
                       onChange={(e) => setNickname(e.target.value)}
-                      className="w-full px-6 py-4 bg-slate-50 border-2 border-slate-100 rounded-2xl focus:border-purple-400 focus:bg-white transition-all outline-none text-xl font-bold"
+                      className="w-full px-4 sm:px-6 py-3 sm:py-4 bg-slate-50 border-2 border-slate-100 rounded-xl sm:rounded-2xl focus:border-purple-400 focus:bg-white transition-all outline-none text-lg sm:text-xl font-bold"
                     />
                   </div>
                   <div>
-                    <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-3 ml-1">
+                    <label className="block text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest mb-2 sm:mb-3 ml-1">
                       选择等级
                     </label>
                     <select
                       value={selectedLevel}
                       onChange={(e) => setSelectedLevel(parseInt(e.target.value))}
-                      className="w-full px-6 py-4 bg-slate-50 border-2 border-slate-100 rounded-2xl focus:border-purple-400 focus:bg-white transition-all outline-none text-base font-bold appearance-none cursor-pointer"
+                      className="w-full px-4 sm:px-6 py-3 sm:py-4 bg-slate-50 border-2 border-slate-100 rounded-xl sm:rounded-2xl focus:border-purple-400 focus:bg-white transition-all outline-none text-sm sm:text-base font-bold appearance-none cursor-pointer"
                       style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2394a3b8'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 1rem center', backgroundSize: '1.5rem' }}
                     >
                       {LEVELS.map((item) => (
@@ -466,49 +575,84 @@ const App = () => {
                     </select>
                   </div>
 
+                  {/* 游戏模式选择 */}
+                  <div className="px-0 sm:px-2">
+                    <label className="block text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest mb-2 sm:mb-3">
+                      游戏模式（至少选一个）
+                    </label>
+                    <div className="flex flex-wrap gap-2 sm:gap-3">
+                      {GAME_MODES.map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          onClick={() => {
+                            if (selectedModes.includes(mode.id)) {
+                              // 至少保留一个选中
+                              if (selectedModes.length > 1) {
+                                setSelectedModes(selectedModes.filter(m => m !== mode.id));
+                              }
+                            } else {
+                              setSelectedModes([...selectedModes, mode.id]);
+                            }
+                          }}
+                          className={`px-3 sm:px-4 py-1.5 sm:py-2 rounded-lg sm:rounded-xl font-bold text-xs sm:text-sm transition-all flex items-center gap-1.5 sm:gap-2 ${
+                            selectedModes.includes(mode.id)
+                              ? 'bg-purple-500 text-white shadow-lg shadow-purple-200'
+                              : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                          }`}
+                        >
+                          <span>{mode.icon}</span>
+                          <span>{mode.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
                   {/* 是否接受陌生人组队 */}
-                  <div className="flex items-center gap-3 px-2">
+                  <div className="flex items-center gap-2 sm:gap-3 px-0 sm:px-2">
                     <button
                       type="button"
                       onClick={() => setAcceptStrangers(!acceptStrangers)}
-                      className={`relative w-12 h-6 rounded-full transition-colors duration-200 focus:outline-none ${
+                      className={`relative w-10 sm:w-12 h-5 sm:h-6 rounded-full transition-colors duration-200 focus:outline-none ${
                         acceptStrangers ? 'bg-purple-500' : 'bg-slate-300'
                       }`}
                     >
                       <span
-                        className={`absolute top-1 left-1 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200 ${
-                          acceptStrangers ? 'translate-x-6' : 'translate-x-0'
+                        className={`absolute top-0.5 sm:top-1 left-0.5 sm:left-1 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200 ${
+                          acceptStrangers ? 'translate-x-5 sm:translate-x-6' : 'translate-x-0'
                         }`}
                       />
                     </button>
                     <div className="flex flex-col">
-                      <span className="text-sm font-bold text-slate-700">
+                      <span className="text-xs sm:text-sm font-bold text-slate-700">
                         接受陌生人组队
                       </span>
-                      <span className="text-xs text-slate-400">
+                      <span className="text-[10px] sm:text-xs text-slate-400">
                         {acceptStrangers ? '陌生人可以直接加入' : '仅限熟人加入'}
                       </span>
                     </div>
                   </div>
                 </div>
-                
-                <div className="md:w-1/3 flex items-end">
-                  <button 
+
+                <div className="md:w-1/3 flex items-end mt-4 md:mt-0">
+                  <button
                     type="submit"
-                    className="w-full h-[64px] bg-slate-900 text-white font-black rounded-2xl shadow-xl hover:bg-purple-600 hover:-translate-y-1 transition-all active:scale-95 flex items-center justify-center gap-2 text-lg"
+                    className="w-full h-12 sm:h-[64px] bg-slate-900 text-white font-black rounded-xl sm:rounded-2xl shadow-xl hover:bg-purple-600 hover:-translate-y-1 transition-all active:scale-95 flex items-center justify-center gap-2 text-base sm:text-lg"
                   >
-                    <PlusCircle size={24} /> 发起预约
+                    <PlusCircle size={20} className="sm:hidden" />
+                    <PlusCircle size={24} className="hidden sm:block" />
+                    发起预约
                   </button>
                 </div>
               </div>
 
               {/* 时间范围选择器 */}
-              <div className="relative pt-10 pb-6">
-                <label className="block text-xs font-black text-slate-400 uppercase tracking-widest mb-8 ml-1 text-center">
-                  请拖动滑块选择时间段：<span className="text-purple-600 text-lg">{stepToTime(timeRange[0])} 到 {stepToTime(timeRange[1])}</span>
+              <div className="relative pt-6 sm:pt-10 pb-4 sm:pb-6">
+                <label className="block text-[10px] sm:text-xs font-black text-slate-400 uppercase tracking-widest mb-4 sm:mb-8 ml-1 text-center">
+                  请拖动滑块选择时间段：<span className="text-purple-600 text-sm sm:text-lg">{stepToTime(timeRange[0])} 到 {stepToTime(timeRange[1])}</span>
                 </label>
-                
-                <div className="relative px-4">
+
+                <div className="relative px-2 sm:px-4">
                   {/* 滑动条本体 */}
                   <div ref={trackRef} className="h-4 w-full bg-slate-100 rounded-full relative cursor-pointer">
                     {/* 选中范围高亮 */}
@@ -563,17 +707,49 @@ const App = () => {
 
         {/* 下方玩家列表 */}
         <section>
-          <div className="flex items-center justify-between mb-8 px-2">
-            <h2 className="text-2xl font-black text-slate-800 flex items-center gap-3">
-              <Users className="text-indigo-600" /> 正在寻找队友的玩家
-            </h2>
-            <div className="h-px flex-1 mx-6 bg-slate-200 hidden md:block" />
-            <span className="text-slate-400 font-bold text-sm bg-slate-100 px-4 py-1 rounded-full">
-              {reservations.length} 个预约
-            </span>
+          {/* 日期选择 Tab */}
+          <div className="mb-0">
+            <div className="bg-white rounded-t-[24px] sm:rounded-t-[32px] shadow-lg shadow-slate-200/30 p-1.5 sm:p-2">
+              <div className="flex gap-1.5 sm:gap-2 overflow-x-auto scrollbar-hide pb-1 -mx-1 px-1">
+                {dateOptions.map((option) => (
+                  <button
+                    key={option.date}
+                    onClick={() => setSelectedDate(option.date)}
+                    className={`flex-shrink-0 px-3 sm:px-5 py-2 sm:py-3 rounded-xl sm:rounded-2xl font-bold transition-all ${
+                      selectedDate === option.date
+                        ? 'bg-slate-900 text-white shadow-lg'
+                        : 'bg-transparent text-slate-500 hover:bg-slate-100'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1 sm:gap-2">
+                      {option.isToday && <span className="text-orange-400 text-xs sm:text-base">🔥</span>}
+                      <span className="text-xs sm:text-sm">{option.label}</span>
+                      <span className={`text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 rounded-full ${
+                        selectedDate === option.date ? 'bg-slate-700 text-slate-300' : 'bg-slate-200 text-slate-500'
+                      }`}>
+                        {option.displayDate}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          <div className="bg-white rounded-b-[24px] sm:rounded-b-[32px] rounded-t-none shadow-xl shadow-slate-200/50 p-4 sm:p-8 border-t border-slate-100">
+            <div className="flex items-center justify-between mb-4 sm:mb-8 px-1 sm:px-2">
+              <h2 className="text-lg sm:text-2xl font-black text-slate-800 flex items-center gap-2 sm:gap-3">
+                <Users className="text-indigo-600 w-5 h-5 sm:w-6 sm:h-6" />
+                <span className="hidden sm:inline">正在寻找队友的玩家</span>
+                <span className="sm:hidden">寻找队友</span>
+              </h2>
+              <div className="h-px flex-1 mx-3 sm:mx-6 bg-slate-200 hidden sm:block" />
+              <span className="text-slate-400 font-bold text-xs sm:text-sm bg-slate-100 px-2 sm:px-4 py-1 rounded-full">
+                {reservations.length} 个
+              </span>
+            </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-6">
             {loading ? (
               <div className="col-span-full text-center py-20">
                 <div className="inline-block w-8 h-8 border-4 border-purple-500 border-t-transparent rounded-full animate-spin" />
@@ -592,94 +768,112 @@ const App = () => {
                     initial={{ opacity: 0, scale: 0.9 }}
                     animate={{ opacity: 1, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.9 }}
-                    whileHover={{ y: -5 }}
-                    className={`relative p-6 rounded-[32px] overflow-hidden transition-all border-2 ${
-                      player.status === 'Matched' 
-                      ? 'bg-slate-100 border-transparent' 
-                      : 'bg-white border-white shadow-xl shadow-slate-200/50'
+                    whileHover={{ y: -3 }}
+                    className={`relative p-4 sm:p-6 rounded-[20px] sm:rounded-[32px] overflow-hidden transition-all border-2 ${
+                      player.status === 'Matched'
+                      ? 'bg-slate-100 border-transparent'
+                      : 'bg-white border-white shadow-lg sm:shadow-xl shadow-slate-200/50'
                     }`}
                   >
                     {/* 卡片装饰图标 */}
-                    <div className="absolute -right-4 -bottom-4 opacity-5 rotate-12">
-                       <Ghost size={100} />
+                    <div className="absolute -right-3 -bottom-3 sm:-right-4 sm:-bottom-4 opacity-5 rotate-12">
+                       <Ghost size={60} className="sm:w-[100px] sm:h-[100px]" />
                     </div>
 
-                    <div className="flex items-start justify-between mb-6">
-                      <div className="flex items-center gap-3">
-                        <div className="w-12 h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-2xl flex items-center justify-center text-white text-xl font-black shadow-lg">
+                    <div className="flex items-start justify-between mb-3 sm:mb-6">
+                      <div className="flex items-center gap-2 sm:gap-3">
+                        <div className="w-10 h-10 sm:w-12 sm:h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl sm:rounded-2xl flex items-center justify-center text-white text-base sm:text-xl font-black shadow-lg">
                           {player.nickname.charAt(0)}
                         </div>
                         <div>
-                          <h3 className="font-bold text-lg text-slate-800">{player.nickname}</h3>
-                          <span className="text-[10px] font-black text-purple-500 uppercase tracking-tighter bg-purple-50 px-2 py-0.5 rounded-md">
-                            LV.{player.level || 1}<span className="ml-2"></span>{LEVELS.find(l => l.level === (player.level || 1))?.title}
+                          <h3 className="font-bold text-sm sm:text-lg text-slate-800">{player.nickname}</h3>
+                          <span className="text-[9px] sm:text-[10px] font-black text-purple-500 uppercase tracking-tighter bg-purple-50 px-1.5 sm:px-2 py-0.5 rounded-md">
+                            LV.{player.level || 1}<span className="ml-1 sm:ml-2"></span>{LEVELS.find(l => l.level === (player.level || 1))?.title}
                           </span>
                         </div>
                       </div>
                     </div>
 
-                    <div className="space-y-3 mb-6">
-                      <div className="flex items-center gap-2 text-slate-500 font-medium text-sm">
-                        <Clock size={14} className="text-slate-400" />
+                    <div className="space-y-2 sm:space-y-3 mb-4 sm:mb-6">
+                      <div className="flex items-center gap-1.5 sm:gap-2 text-slate-500 font-medium text-xs sm:text-sm">
+                        <Clock size={12} className="text-slate-400 sm:w-3.5 sm:h-3.5" />
                         <span>时间段: <span className="text-slate-800 font-bold">{player.start_time}–{player.end_time}</span></span>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <div className={`w-2 h-2 rounded-full ${player.status === 'Matched' ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} />
-                        <span className={`text-xs font-bold ${player.status === 'Matched' ? 'text-green-600' : 'text-blue-600'}`}>
-                          {player.status === 'Matched' ? '已完成匹配' : '正在空等待加入...'}
+                      {/* 游戏模式 */}
+                      {player.game_modes && player.game_modes.length > 0 && (
+                        <div className="flex flex-wrap gap-1 sm:gap-1.5">
+                          {player.game_modes.map((modeId) => {
+                            const mode = GAME_MODES.find(m => m.id === modeId);
+                            return mode ? (
+                              <span
+                                key={modeId}
+                                className="inline-flex items-center gap-0.5 sm:gap-1 px-1.5 sm:px-2 py-0.5 bg-indigo-50 text-indigo-600 text-[9px] sm:text-[10px] font-bold rounded"
+                              >
+                                <span>{mode.icon}</span>
+                                <span>{mode.label}</span>
+                              </span>
+                            ) : null;
+                          })}
+                        </div>
+                      )}
+                      <div className="flex items-center gap-1.5 sm:gap-2">
+                        <div className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${player.status === 'Matched' ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} />
+                        <span className={`text-[10px] sm:text-xs font-bold ${player.status === 'Matched' ? 'text-green-600' : 'text-blue-600'}`}>
+                          {player.status === 'Matched' ? '已匹配' : '等待加入...'}
                         </span>
                       </div>
                       {/* 显示是否接受陌生人 */}
                       {player.accept_strangers ? (
-                        <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 rounded-full bg-purple-400" />
-                          <span className="text-xs font-bold text-purple-600">
-                            接受陌生人组队
+                        <div className="flex items-center gap-1.5 sm:gap-2">
+                          <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-purple-400" />
+                          <span className="text-[10px] sm:text-xs font-bold text-purple-600">
+                            接受陌生人
                           </span>
                         </div>
                       ) : (
-                        <div className="flex items-center gap-2">
-                          <Lock size={10} className="text-orange-500" />
-                          <span className="text-xs font-bold text-orange-600">
-                            仅限熟人加入
+                        <div className="flex items-center gap-1.5 sm:gap-2">
+                          <Lock size={9} className="text-orange-500 sm:w-2.5 sm:h-2.5" />
+                          <span className="text-[10px] sm:text-xs font-bold text-orange-600">
+                            仅限熟人
                           </span>
                         </div>
                       )}
                     </div>
 
                     {player.status === 'Matched' ? (
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-2 bg-green-50 p-3 rounded-2xl border border-green-100">
-                          <CheckCircle2 size={16} className="text-green-500" />
-                          <p className="text-xs font-bold text-green-700">队友：{player.teammate}</p>
+                      <div className="space-y-1.5 sm:space-y-2">
+                        <div className="flex items-center gap-1.5 sm:gap-2 bg-green-50 p-2 sm:p-3 rounded-xl sm:rounded-2xl border border-green-100">
+                          <CheckCircle2 size={14} className="text-green-500 sm:w-4 sm:h-4" />
+                          <p className="text-[10px] sm:text-xs font-bold text-green-700">队友：{player.teammate}</p>
                         </div>
                         {player.team_name ? (
-                          <div className="flex items-center gap-1.5 px-3 py-1.5">
-                            <Sparkles size={12} className="text-purple-400" />
-                            <p className="text-[10px] font-medium text-slate-400">
+                          <div className="flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1 sm:py-1.5">
+                            <Sparkles size={10} className="text-purple-400 sm:w-3 sm:h-3" />
+                            <p className="text-[9px] sm:text-[10px] font-medium text-slate-400">
                               队名：<span className="text-purple-500 font-bold">{player.team_name}</span>
                             </p>
                           </div>
                         ) : (
-                          <div className="flex items-center gap-2 px-3 py-1.5">
-                            <div className="w-3 h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
-                            <p className="text-[10px] font-medium text-purple-400">正在生成队名...</p>
+                          <div className="flex items-center gap-1.5 sm:gap-2 px-2 sm:px-3 py-1 sm:py-1.5">
+                            <div className="w-2.5 h-2.5 sm:w-3 sm:h-3 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                            <p className="text-[9px] sm:text-[10px] font-medium text-purple-400">生成队名...</p>
                           </div>
                         )}
                       </div>
                     ) : (
-                      <button 
+                      <button
                         onClick={() => handleJoin(player)}
-                        className="w-full bg-indigo-50 text-indigo-600 font-black py-3 rounded-2xl hover:bg-indigo-600 hover:text-white transition-all flex items-center justify-center gap-2 group"
+                        className="w-full bg-indigo-50 text-indigo-600 font-black py-2 sm:py-3 rounded-xl sm:rounded-2xl hover:bg-indigo-600 hover:text-white transition-all flex items-center justify-center gap-1.5 sm:gap-2 group text-sm sm:text-base"
                       >
-                        加入对战 2v2
-                        <div className="w-1.5 h-1.5 bg-indigo-400 rounded-full group-hover:bg-white animate-bounce" />
+                        加入对战
+                        <div className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-indigo-400 rounded-full group-hover:bg-white animate-bounce" />
                       </button>
                     )}
                   </motion.div>
                 ))}
               </AnimatePresence>
             )}
+          </div>
           </div>
         </section>
       </div>
@@ -691,31 +885,31 @@ const App = () => {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-4"
             onClick={cancelSubmit}
           >
             <motion.div
               initial={{ scale: 0.9, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               exit={{ scale: 0.9, opacity: 0 }}
-              className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl"
+              className="bg-white rounded-2xl sm:rounded-3xl p-5 sm:p-8 max-w-md w-full shadow-2xl"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="text-center mb-6">
-                <div className="w-16 h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                  <User size={32} className="text-purple-600" />
+              <div className="text-center mb-4 sm:mb-6">
+                <div className="w-12 h-12 sm:w-16 sm:h-16 bg-purple-100 rounded-full flex items-center justify-center mx-auto mb-3 sm:mb-4">
+                  <User size={24} className="text-purple-600 sm:w-8 sm:h-8" />
                 </div>
-                <h3 className="text-xl font-black text-slate-800 mb-2">
+                <h3 className="text-lg sm:text-xl font-black text-slate-800 mb-1 sm:mb-2">
                   请留下您的联系方式
                 </h3>
-                <p className="text-sm text-slate-500">
+                <p className="text-xs sm:text-sm text-slate-500">
                   方便队友加入后联系您
                 </p>
               </div>
 
-              <div className="space-y-4">
+              <div className="space-y-3 sm:space-y-4">
                 <div>
-                  <label className="block text-sm font-bold text-slate-700 mb-2">
+                  <label className="block text-xs sm:text-sm font-bold text-slate-700 mb-1.5 sm:mb-2">
                     QQ号码 {acceptStrangers ? (
                       <span className="text-red-500">*</span>
                     ) : (
@@ -727,25 +921,25 @@ const App = () => {
                     placeholder="输入您的QQ号..."
                     value={qqNumber}
                     onChange={(e) => setQQNumber(e.target.value)}
-                    className="w-full px-4 py-3 bg-slate-50 border-2 border-slate-200 rounded-xl focus:border-purple-500 focus:bg-white transition-all outline-none text-lg font-bold"
+                    className="w-full px-3 sm:px-4 py-2.5 sm:py-3 bg-slate-50 border-2 border-slate-200 rounded-lg sm:rounded-xl focus:border-purple-500 focus:bg-white transition-all outline-none text-base sm:text-lg font-bold"
                   />
                   {acceptStrangers && (
-                    <p className="text-xs text-purple-600 mt-2">
+                    <p className="text-[10px] sm:text-xs text-purple-600 mt-1.5 sm:mt-2">
                       您选择了接受陌生人组队，QQ号码是必填项
                     </p>
                   )}
                 </div>
 
-                <div className="flex gap-3 pt-4">
+                <div className="flex gap-2 sm:gap-3 pt-3 sm:pt-4">
                   <button
                     onClick={cancelSubmit}
-                    className="flex-1 py-3 px-4 bg-slate-100 text-slate-700 font-bold rounded-xl hover:bg-slate-200 transition-all"
+                    className="flex-1 py-2.5 sm:py-3 px-3 sm:px-4 bg-slate-100 text-slate-700 font-bold rounded-lg sm:rounded-xl hover:bg-slate-200 transition-all text-sm sm:text-base"
                   >
                     取消
                   </button>
                   <button
                     onClick={confirmSubmit}
-                    className="flex-1 py-3 px-4 bg-purple-600 text-white font-bold rounded-xl hover:bg-purple-700 transition-all"
+                    className="flex-1 py-2.5 sm:py-3 px-3 sm:px-4 bg-purple-600 text-white font-bold rounded-lg sm:rounded-xl hover:bg-purple-700 transition-all text-sm sm:text-base"
                   >
                     确认发布
                   </button>
