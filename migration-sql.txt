@@ -1,0 +1,75 @@
+-- ============================================
+-- 1. 添加 creator_id 字段
+-- ============================================
+ALTER TABLE teams ADD COLUMN IF NOT EXISTS creator_id UUID;
+
+-- ============================================
+-- 2. 清理所有旧策略
+-- ============================================
+DROP POLICY IF EXISTS "teams_select_all" ON teams;
+DROP POLICY IF EXISTS "teams_select_policy" ON teams;
+DROP POLICY IF EXISTS "teams_insert_auth" ON teams;
+DROP POLICY IF EXISTS "team_members_select_self" ON team_members;
+DROP POLICY IF EXISTS "team_members_insert_self" ON team_members;
+
+-- ============================================
+-- 3. teams 表策略
+-- ============================================
+-- SELECT: open 所有人可见，matched 只有 creator 可见
+CREATE POLICY "teams_select_policy"
+  ON teams FOR SELECT
+  USING (
+    status = 'open'
+    OR creator_id = auth.uid()
+  );
+
+-- INSERT: 已登录用户可创建
+CREATE POLICY "teams_insert_auth"
+  ON teams FOR INSERT
+  TO authenticated
+  WITH CHECK (true);
+
+-- ============================================
+-- 4. team_members 表策略
+-- ============================================
+-- SELECT: 只能看到自己
+CREATE POLICY "team_members_select_self"
+  ON team_members FOR SELECT
+  USING (user_id = auth.uid());
+
+-- INSERT: 只能插入自己
+CREATE POLICY "team_members_insert_self"
+  ON team_members FOR INSERT
+  TO authenticated
+  WITH CHECK (user_id = auth.uid());
+
+-- ============================================
+-- 5. RPC function（获取完整成员信息）
+-- ============================================
+CREATE OR REPLACE FUNCTION get_team_members(p_team_id UUID)
+RETURNS TABLE (
+  user_id UUID,
+  nickname TEXT,
+  qq_number TEXT,
+  is_owner BOOLEAN
+)
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+  SELECT 
+    team_members.user_id,
+    team_members.nickname,
+    team_members.qq_number,
+    team_members.is_owner
+  FROM team_members
+  WHERE team_members.team_id = p_team_id
+    AND EXISTS (
+      SELECT 1 
+      FROM team_members AS tm
+      WHERE tm.team_id = p_team_id 
+        AND tm.user_id = auth.uid()
+    );
+$$;
+
+GRANT EXECUTE ON FUNCTION get_team_members TO authenticated;
+GRANT EXECUTE ON FUNCTION get_team_members TO anon;

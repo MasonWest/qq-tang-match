@@ -1,12 +1,12 @@
 ﻿import React, { useState, useEffect, useRef } from 'react';
 import { User, Clock, Users, PlusCircle, CheckCircle2, Trophy, Ghost, Sparkles, Lock, Copy, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { supabase } from './supabaseClient';
+import { supabase, ensureAnonymousAuth } from './supabaseClient';
 
 // --- 豆包API配置 ---
 const DOUBAO_API_URL = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
 const DOUBAO_API_KEY = import.meta.env.VITE_DOUBAO_API_KEY;
-const DOUBAO_MODEL = 'doubao-seed-2-0-pro-260215';
+const DOUBAO_MODEL = 'doubao1-seed-2-0-pro-260215';
 
 // 生成队名函数
 const generateTeamName = async (nickname1, nickname2) => {
@@ -180,6 +180,7 @@ const App = () => {
   const [selectedModes, setSelectedModes] = useState(['football']); // 默认勾选足球
   const [reservations, setReservations] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [currentUserId, setCurrentUserId] = useState(null); // 当前用户ID
 
   // QQ弹窗相关状态
   const [showQQModal, setShowQQModal] = useState(false);
@@ -193,35 +194,38 @@ const App = () => {
   // 加入时输入昵称弹窗
   const [showJoinModal, setShowJoinModal] = useState(false);
   const [joinNickname, setJoinNickname] = useState('');
+  const [joinQQNumber, setJoinQQNumber] = useState(''); // 加入者QQ号码
   const [joiningPlayer, setJoiningPlayer] = useState(null);
+
+  // 查看队友弹窗
+  const [showTeammatesModal, setShowTeammatesModal] = useState(false);
+  const [teammatesInfo, setTeammatesInfo] = useState(null);
 
   // 拖拽相关
   const trackRef = useRef(null);
   const [dragging, setDragging] = useState(null); // 'start' or 'end'
 
-  // 获取预约列表（按选中日期过滤）
+  // 获取预约列表（按选中日期过滤，不过滤 status，前端自行判断显示）
   const fetchReservations = async () => {
     setLoading(true);
     const { data } = await supabase
-      .from('reservations')
+      .from('teams')
       .select('*')
       .eq('date', selectedDate)
       .order('created_at', { ascending: false });
-    // 前端排序：Waiting 在前，Matched 在后，同状态下新的在前
-    const sortedData = (data || []).sort((a, b) => {
-      // Waiting 状态排在前面
-      if (a.status === 'Waiting' && b.status === 'Matched') return -1;
-      if (a.status === 'Matched' && b.status === 'Waiting') return 1;
-      // 同状态下按时间倒序（新的在前）
-      return new Date(b.created_at) - new Date(a.created_at);
-    });
-    setReservations(sortedData);
+    setReservations(data || []);
     setLoading(false);
   };
 
   // 初始化加载（移除实时订阅，通过刷新获取更新）
   useEffect(() => {
-    fetchReservations();
+    ensureAnonymousAuth().then(async () => {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        setCurrentUserId(user.id);
+      }
+      fetchReservations();
+    });
   }, [selectedDate]);
 
   const handleMouseDown = (type) => (e) => {
@@ -280,21 +284,35 @@ const App = () => {
       return;
     }
 
-    // 检查该昵称是否已有任何预约记录（无论是否匹配成功，当天只能有一个队友）
-    const existingAsPublisher = reservations.find(
-      r => r.nickname === nickname.trim()
-    );
-    if (existingAsPublisher) {
-      alert('您今天已经创建过预约了，排位每天只能固定一个队友');
+    let userId = currentUserId;
+    if (!userId) {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        userId = user.id;
+        setCurrentUserId(user.id);
+      } else {
+        alert('无法确认用户身份，请刷新页面重试');
+        return;
+      }
+    }
+
+    // 检查当前用户是否已在当天发布过队伍
+    const { data: existingMember, error: checkError } = await supabase
+      .from('team_members')
+      .select('team_id, teams!inner(date)')
+      .eq('user_id', userId)
+      .eq('is_owner', true)
+      .eq('teams.date', selectedDate)
+      .limit(1);
+
+    if (checkError) {
+      console.error('检查重复发布失败:', checkError);
+      alert('检查发布状态失败，请重试');
       return;
     }
 
-    // 检查该昵称是否已作为队友加入过其他队伍
-    const existingAsTeammate = reservations.find(
-      r => r.teammate === nickname.trim()
-    );
-    if (existingAsTeammate) {
-      alert('您今天已经加入过队伍了，排位每天只能固定一个队友');
+    if (existingMember && existingMember.length > 0) {
+      alert('您今天已经创建过预约了，排位每天只能固定一个队友');
       return;
     }
 
@@ -305,6 +323,10 @@ const App = () => {
 
   // 确认提交（带QQ）
   const confirmSubmit = async () => {
+    // 防止重复提交
+    if (!pendingSubmit) return;
+    setPendingSubmit(false);
+
     // 验证至少选择一个游戏模式
     if (selectedModes.length === 0) {
       alert('请至少选择一个游戏模式');
@@ -317,61 +339,86 @@ const App = () => {
       return;
     }
 
-    const { error } = await supabase
-      .from('reservations')
+    const { data: teamData, error: teamError } = await supabase
+      .from('teams')
       .insert([{
-        nickname: nickname,
-        date: selectedDate,  // 使用全局选中的日期
-        start_time: stepToTime(timeRange[0]),
-        end_time: stepToTime(timeRange[1]),
-        level: selectedLevel,
-        game_modes: selectedModes,
-        accept_strangers: acceptStrangers,
-        qq_number: qqNumber.trim() || null
-      }]);
-
-    if (!error) {
-      localStorage.setItem('lastSubmitTime', Date.now().toString());
-
-      // 构造新预约数据，本地立即显示
-      const newReservation = {
-        id: Date.now().toString(), // 临时ID
-        nickname: nickname,
         date: selectedDate,
         start_time: stepToTime(timeRange[0]),
         end_time: stepToTime(timeRange[1]),
         level: selectedLevel,
         game_modes: selectedModes,
         accept_strangers: acceptStrangers,
-        qq_number: qqNumber.trim() || null,
-        status: 'Waiting',
-        teammate: null,
-        team_name: null,
-        created_at: new Date().toISOString()
-      };
+        status: 'open',
+        creator_nickname: nickname.trim(),
+        creator_qq: qqNumber.trim() || null
+      }])
+      .select();
 
-      // 本地立即添加到列表
-      setReservations(prev => {
-        const updated = [newReservation, ...prev];
-        // 重新排序：Waiting在前，Matched在后
-        return updated.sort((a, b) => {
-          if (a.status === 'Waiting' && b.status === 'Matched') return -1;
-          if (a.status === 'Matched' && b.status === 'Waiting') return 1;
-          return new Date(b.created_at) - new Date(a.created_at);
-        });
-      });
-
-      // 重置表单
-      setNickname('');
-      setSelectedLevel(1);
-      setAcceptStrangers(false);
-      setSelectedModes(['football']);
-      setQQNumber('');
-      setShowQQModal(false);
-      setPendingSubmit(false);
-    } else {
-      alert('发布失败：' + error.message);
+    if (teamError) {
+      alert('发布失败：' + teamError.message);
+      return;
     }
+
+    const teamId = teamData[0].id;
+    const { data: { user } } = await supabase.auth.getUser();
+
+    const { error: memberError } = await supabase
+      .from('team_members')
+      .insert([{
+        team_id: teamId,
+        user_id: user.id,
+        nickname: nickname.trim(),
+        qq_number: qqNumber.trim() || null,
+        is_owner: true
+      }]);
+
+    if (memberError) {
+      alert('发布失败：' + memberError.message);
+      return;
+    }
+
+    localStorage.setItem('lastSubmitTime', Date.now().toString());
+
+    // 构造新预约数据，本地立即显示
+    const newReservation = {
+      id: teamId,
+      date: selectedDate,
+      start_time: stepToTime(timeRange[0]),
+      end_time: stepToTime(timeRange[1]),
+      level: selectedLevel,
+      game_modes: selectedModes,
+      accept_strangers: acceptStrangers,
+      status: 'open',
+      team_name: null,
+      creator_nickname: nickname.trim(),
+      creator_qq: qqNumber.trim() || null,
+      created_at: new Date().toISOString(),
+      team_members: [{
+        user_id: user.id,
+        nickname: nickname.trim(),
+        qq_number: qqNumber.trim() || null,
+        is_owner: true
+      }]
+    };
+
+    // 本地立即添加到列表
+    setReservations(prev => [newReservation, ...prev]);
+
+    // 记录用户创建/加入的队伍 ID
+    const userTeams = JSON.parse(localStorage.getItem('userTeams') || '[]');
+    if (!userTeams.includes(teamId)) {
+      userTeams.push(teamId);
+      localStorage.setItem('userTeams', JSON.stringify(userTeams));
+    }
+
+    // 重置表单
+    setNickname('');
+    setSelectedLevel(1);
+    setAcceptStrangers(false);
+    setSelectedModes(['football']);
+    setQQNumber('');
+    setShowQQModal(false);
+    setPendingSubmit(false);
   };
 
   // 取消提交
@@ -403,90 +450,143 @@ const App = () => {
       return;
     }
 
+    if (joiningPlayer.accept_strangers && !joinQQNumber.trim()) {
+      alert('该队伍接受陌生人组队，QQ号码是必填项');
+      return;
+    }
+
     if (!joiningPlayer) return;
 
-    // 检查该昵称是否已作为发布者存在（当天只能有一个队友）
-    const existingAsPublisher = reservations.find(
-      r => r.nickname === joinNickname.trim()
-    );
-    if (existingAsPublisher) {
-      alert('您今天已经创建过预约了，排位每天只能固定一个队友');
+    const trimmedJoinNickname = joinNickname.trim();
+    const trimmedJoinQQNumber = joinQQNumber.trim();
+
+    let userId = currentUserId;
+    if (!userId) {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        userId = user.id;
+        setCurrentUserId(user.id);
+      } else {
+        alert('无法确认用户身份，请刷新页面重试');
+        return;
+      }
+    }
+
+    // 检查当前用户是否已在当天发布或加入过队伍
+    const { data: existingMember, error: checkError } = await supabase
+      .from('team_members')
+      .select('team_id, teams!inner(date)')
+      .eq('user_id', userId)
+      .eq('teams.date', selectedDate)
+      .limit(1);
+
+    if (checkError) {
+      console.error('检查重复加入失败:', checkError);
+      alert('检查加入状态失败，请重试');
       return;
     }
 
-    // 检查该昵称是否已作为队友加入过其他队伍
-    const existingAsTeammate = reservations.find(
-      r => r.teammate === joinNickname.trim()
-    );
-    if (existingAsTeammate) {
-      alert('您今天已经加入过队伍了，排位每天只能固定一个队友');
+    if (existingMember && existingMember.length > 0) {
+      alert('您今天已经发布或加入过队伍了，排位每天只能固定一个队友');
       return;
     }
 
-    // 先更新数据库，立即加入
+    // 先插入 team_member（这样才有权限 update teams）
     try {
-      const { error } = await supabase
-        .from('reservations')
+      const { data: { user: joinUser } } = await supabase.auth.getUser();
+
+      const { error: memberError } = await supabase
+        .from('team_members')
+        .insert([{
+          team_id: joiningPlayer.id,
+          user_id: joinUser.id,
+          nickname: trimmedJoinNickname,
+          qq_number: trimmedJoinQQNumber || null,
+          is_owner: false
+        }]);
+
+      if (memberError) {
+        console.error('队员插入失败:', memberError);
+        alert('加入失败：' + memberError.message);
+        return;
+      }
+
+      // 成为成员后再更新 team 状态和加入者信息
+      const { error: teamError } = await supabase
+        .from('teams')
         .update({
-          status: 'Matched',
-          teammate: joinNickname.trim()
+          status: 'matched',
+          joiner_nickname: trimmedJoinNickname,
+          joiner_qq_number: trimmedJoinQQNumber || null
         })
         .eq('id', joiningPlayer.id);
 
-      if (error) {
-        console.error('数据库更新失败:', error);
-        alert('加入失败：' + error.message);
+      if (teamError) {
+        console.error('数据库更新失败:', teamError);
+        alert('加入失败：' + teamError.message);
         return;
       }
 
       console.log('加入成功');
       localStorage.setItem('lastJoinTime', Date.now().toString());
 
-      // 本地更新该玩家状态为已匹配
-      setReservations(prev => {
-        const updated = prev.map(p =>
-          p.id === joiningPlayer.id
-            ? { ...p, status: 'Matched', teammate: joinNickname.trim() }
-            : p
-        );
-        // 重新排序：Waiting在前，Matched在后
-        return updated.sort((a, b) => {
-          if (a.status === 'Waiting' && b.status === 'Matched') return -1;
-          if (a.status === 'Matched' && b.status === 'Waiting') return 1;
-          return new Date(b.created_at) - new Date(a.created_at);
-        });
-      });
+      // 记录用户加入的队伍 ID
+      const userTeams = JSON.parse(localStorage.getItem('userTeams') || '[]');
+      if (!userTeams.includes(joiningPlayer.id)) {
+        userTeams.push(joiningPlayer.id);
+        localStorage.setItem('userTeams', JSON.stringify(userTeams));
+      }
 
       // 关闭加入弹窗
       setShowJoinModal(false);
       setJoinNickname('');
+      setJoinQQNumber(''); // 清空加入者QQ号码
 
-      // 如果发布者留下了QQ，显示查看联系方式弹窗
-      if (joiningPlayer.qq_number) {
-        setContactInfo({
-          qq: joiningPlayer.qq_number,
-          nickname: joiningPlayer.nickname
-        });
-        setShowContactModal(true);
-      }
+      // 重新从数据库获取最新数据（只查 teams，不 join team_members）
+      const { data: updatedTeam } = await supabase
+        .from('teams')
+        .select('*')
+        .eq('id', joiningPlayer.id)
+        .single();
 
-      // 异步生成队名（不阻塞）
-      generateTeamName(joiningPlayer.nickname, joinNickname.trim()).then(async (teamName) => {
-        console.log('生成的队名:', teamName);
-        // 更新队名到数据库
-        await supabase
-          .from('reservations')
-          .update({ team_name: teamName })
-          .eq('id', joiningPlayer.id);
-        // 本地更新队名
+      if (updatedTeam) {
+        // 更新本地列表中的该队伍数据
         setReservations(prev =>
           prev.map(p =>
-            p.id === joiningPlayer.id ? { ...p, team_name: teamName } : p
+            p.id === joiningPlayer.id ? updatedTeam : p
           )
         );
-      }).catch(err => {
-        console.error('生成队名失败:', err);
-      });
+
+        const ownerNickname = updatedTeam.creator_nickname;
+        const ownerQQ = updatedTeam.creator_qq;
+
+        // 如果发布者留下了QQ，显示查看联系方式弹窗
+        if (ownerQQ) {
+          setContactInfo({
+            qq: ownerQQ,
+            nickname: ownerNickname
+          });
+          setShowContactModal(true);
+        }
+
+        // 异步生成队名（不阻塞）
+        generateTeamName(ownerNickname, trimmedJoinNickname).then(async (teamName) => {
+          console.log('生成的队名:', teamName);
+          // 更新队名到数据库
+          await supabase
+            .from('teams')
+            .update({ team_name: teamName })
+            .eq('id', joiningPlayer.id);
+          // 本地更新队名
+          setReservations(prev =>
+            prev.map(p =>
+              p.id === joiningPlayer.id ? { ...p, team_name: teamName } : p
+            )
+          );
+        }).catch(err => {
+          console.error('生成队名失败:', err);
+        });
+      }
 
       setJoiningPlayer(null);
     } catch (err) {
@@ -499,7 +599,31 @@ const App = () => {
   const cancelJoin = () => {
     setShowJoinModal(false);
     setJoinNickname('');
+    setJoinQQNumber(''); // 清空加入者QQ号码
     setJoiningPlayer(null);
+  };
+
+  // 查看队友信息
+  const viewTeammates = async (team) => {
+    // 从 teams 表获取冗余字段
+    const ownerInfo = {
+      nickname: team.creator_nickname || '未知',
+      qq_number: team.creator_qq,
+      is_owner: true
+    };
+
+    const joinerInfo = team.joiner_nickname ? {
+      nickname: team.joiner_nickname,
+      qq_number: team.joiner_qq_number,
+      is_owner: false
+    } : null;
+
+    setTeammatesInfo({
+      owner: ownerInfo,
+      joiner: joinerInfo,
+      teamName: team.team_name
+    });
+    setShowTeammatesModal(true);
   };
 
   // 复制QQ到剪贴板
@@ -532,6 +656,11 @@ const App = () => {
           <h1 className="text-3xl sm:text-5xl md:text-6xl font-black text-white tracking-tighter drop-shadow-md">
             QQ TANG <span className="text-yellow-300">HUB</span>
           </h1>
+          {currentUserId && (
+            <div className="text-xs sm:text-sm text-white/70 mt-2 sm:mt-3 text-right">
+              当前身份ID：{currentUserId} (仅用于本次使用)
+            </div>
+          )}
         </header>
 
         {/* 上方游戏预约卡片 */}
@@ -761,7 +890,25 @@ const App = () => {
               </div>
             ) : (
               <AnimatePresence mode="popLayout">
-                {reservations.map((player) => (
+                {reservations
+                  .filter((player) => {
+                    // open 队伍：所有人可见
+                    if (player.status === 'open') return true;
+                    // matched 队伍：只有 creator 或成员可见
+                    if (player.status === 'matched') {
+                      // 判断是否是 creator（通过 creator_nickname 对比不够准确，用 currentUserId 判断成员身份）
+                      // 这里需要调用 RPC 或检查 team_members，但 RLS 限制了查询
+                      // 简化方案：前端通过 local storage 记录用户创建/加入的队伍 ID
+                      const userTeams = JSON.parse(localStorage.getItem('userTeams') || '[]');
+                      return userTeams.includes(player.id);
+                    }
+                    return false;
+                  })
+                  .map((player) => {
+                  const creatorName = player.creator_nickname || '未知';
+                  const isMatched = player.status === 'matched';
+
+                  return (
                   <motion.div
                     key={player.id}
                     layout
@@ -770,7 +917,7 @@ const App = () => {
                     exit={{ opacity: 0, scale: 0.9 }}
                     whileHover={{ y: -3 }}
                     className={`relative p-4 sm:p-6 rounded-[20px] sm:rounded-[32px] overflow-hidden transition-all border-2 ${
-                      player.status === 'Matched'
+                      isMatched
                       ? 'bg-slate-100 border-transparent'
                       : 'bg-white border-white shadow-lg sm:shadow-xl shadow-slate-200/50'
                     }`}
@@ -783,10 +930,10 @@ const App = () => {
                     <div className="flex items-start justify-between mb-3 sm:mb-6">
                       <div className="flex items-center gap-2 sm:gap-3">
                         <div className="w-10 h-10 sm:w-12 sm:h-12 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl sm:rounded-2xl flex items-center justify-center text-white text-base sm:text-xl font-black shadow-lg">
-                          {player.nickname.charAt(0)}
+                          {creatorName.charAt(0)}
                         </div>
                         <div>
-                          <h3 className="font-bold text-sm sm:text-lg text-slate-800">{player.nickname}</h3>
+                          <h3 className="font-bold text-sm sm:text-lg text-slate-800">{creatorName}</h3>
                           <span className="text-[9px] sm:text-[10px] font-black text-purple-500 uppercase tracking-tighter bg-purple-50 px-1.5 sm:px-2 py-0.5 rounded-md">
                             LV.{player.level || 1}<span className="ml-1 sm:ml-2"></span>{LEVELS.find(l => l.level === (player.level || 1))?.title}
                           </span>
@@ -817,9 +964,9 @@ const App = () => {
                         </div>
                       )}
                       <div className="flex items-center gap-1.5 sm:gap-2">
-                        <div className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${player.status === 'Matched' ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} />
-                        <span className={`text-[10px] sm:text-xs font-bold ${player.status === 'Matched' ? 'text-green-600' : 'text-blue-600'}`}>
-                          {player.status === 'Matched' ? '已匹配' : '等待加入...'}
+                        <div className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${isMatched ? 'bg-green-500' : 'bg-blue-500 animate-pulse'}`} />
+                        <span className={`text-[10px] sm:text-xs font-bold ${isMatched ? 'text-green-600' : 'text-blue-600'}`}>
+                          {isMatched ? '已匹配' : '等待加入...'}
                         </span>
                       </div>
                       {/* 显示是否接受陌生人 */}
@@ -840,12 +987,9 @@ const App = () => {
                       )}
                     </div>
 
-                    {player.status === 'Matched' ? (
+                    {isMatched ? (
                       <div className="space-y-1.5 sm:space-y-2">
-                        <div className="flex items-center gap-1.5 sm:gap-2 bg-green-50 p-2 sm:p-3 rounded-xl sm:rounded-2xl border border-green-100">
-                          <CheckCircle2 size={14} className="text-green-500 sm:w-4 sm:h-4" />
-                          <p className="text-[10px] sm:text-xs font-bold text-green-700">队友：{player.teammate}</p>
-                        </div>
+                        {/* matched 队伍：成员可查看队友信息和队名 */}
                         {player.team_name ? (
                           <div className="flex items-center gap-1 sm:gap-1.5 px-2 sm:px-3 py-1 sm:py-1.5">
                             <Sparkles size={10} className="text-purple-400 sm:w-3 sm:h-3" />
@@ -859,6 +1003,14 @@ const App = () => {
                             <p className="text-[9px] sm:text-[10px] font-medium text-purple-400">生成队名...</p>
                           </div>
                         )}
+                        {/* 查看队友按钮 */}
+                        <button
+                          onClick={() => viewTeammates(player)}
+                          className="w-full bg-green-100 text-green-700 font-bold py-2 sm:py-3 rounded-xl sm:rounded-2xl hover:bg-green-200 transition-all flex items-center justify-center gap-1.5 sm:gap-2 text-sm sm:text-base"
+                        >
+                          <CheckCircle2 size={14} />
+                          查看队友
+                        </button>
                       </div>
                     ) : (
                       <button
@@ -870,7 +1022,8 @@ const App = () => {
                       </button>
                     )}
                   </motion.div>
-                ))}
+                )})
+                }
               </AnimatePresence>
             )}
           </div>
@@ -930,6 +1083,9 @@ const App = () => {
                   )}
                 </div>
 
+                <p className="text-xs sm:text-sm text-slate-500 font-semibold mb-3 sm:mb-4 text-center">
+                  QQ 仅在匹配成功后对队友可见
+                </p>
                 <div className="flex gap-2 sm:gap-3 pt-3 sm:pt-4">
                   <button
                     onClick={cancelSubmit}
@@ -943,8 +1099,7 @@ const App = () => {
                   >
                     确认发布
                   </button>
-                </div>
-              </div>
+                </div>              </div>
             </motion.div>
           </motion.div>
         )}
@@ -975,7 +1130,7 @@ const App = () => {
                   加入队伍
                 </h3>
                 <p className="text-sm text-slate-500">
-                  您即将加入 <span className="font-bold text-indigo-600">{joiningPlayer.nickname}</span> 的队伍
+                  您即将加入 <span className="font-bold text-indigo-600">{joiningPlayer.creator_nickname || '未知'}</span> 的队伍
                 </p>
               </div>
 
@@ -992,6 +1147,24 @@ const App = () => {
                     className="w-full px-4 py-3 bg-slate-50 border-2 border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white transition-all outline-none text-lg font-bold"
                     autoFocus
                   />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-bold text-slate-700 mb-2">
+                    您的QQ号码 {joiningPlayer?.accept_strangers ? (<span className="text-red-500">*</span>) : (<span className="text-slate-400 font-normal">(可选)</span>)}
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="输入您的QQ号..."
+                    value={joinQQNumber}
+                    onChange={(e) => setJoinQQNumber(e.target.value)}
+                    className="w-full px-4 py-3 bg-slate-50 border-2 border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white transition-all outline-none text-lg font-bold"
+                  />
+                  {joiningPlayer?.accept_strangers && (
+                    <p className="text-[10px] sm:text-xs text-indigo-600 mt-1.5 sm:mt-2">
+                      该队伍接受陌生人组队，QQ号码是必填项
+                    </p>
+                  )}
                 </div>
 
                 <div className="bg-slate-50 rounded-xl p-4 space-y-2">
@@ -1079,6 +1252,96 @@ const App = () => {
               <button
                 onClick={() => setShowContactModal(false)}
                 className="w-full py-3 bg-purple-600 text-white font-bold rounded-xl hover:bg-purple-700 transition-all"
+              >
+                知道了
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 查看队友弹窗 */}
+      <AnimatePresence>
+        {showTeammatesModal && teammatesInfo && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setShowTeammatesModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="text-center mb-6">
+                <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
+                  <Users size={32} className="text-green-600" />
+                </div>
+                <h3 className="text-xl font-black text-slate-800 mb-2">
+                  队伍成员
+                </h3>
+                {teammatesInfo.teamName && (
+                  <p className="text-sm text-purple-500 font-bold">
+                    队名：{teammatesInfo.teamName}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-4">
+                {/* 发布人 */}
+                <div className="bg-indigo-50 rounded-xl p-4">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-xs text-slate-500 font-bold mb-1">发布人</p>
+                      <p className="text-lg font-black text-slate-800">{teammatesInfo.owner.nickname}</p>
+                    </div>
+                    {teammatesInfo.owner.qq_number && (
+                      <button
+                        onClick={() => copyQQ(teammatesInfo.owner.qq_number)}
+                        className="p-2 bg-white rounded-xl shadow-sm hover:shadow-md transition-all text-indigo-600"
+                        title="复制QQ"
+                      >
+                        <Copy size={18} />
+                      </button>
+                    )}
+                  </div>
+                  {teammatesInfo.owner.qq_number && (
+                    <p className="text-sm text-slate-600 mt-2">QQ: {teammatesInfo.owner.qq_number}</p>
+                  )}
+                </div>
+
+                {/* 加入者 */}
+                {teammatesInfo.joiner && (
+                  <div className="bg-pink-50 rounded-xl p-4">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-xs text-slate-500 font-bold mb-1">加入者</p>
+                        <p className="text-lg font-black text-slate-800">{teammatesInfo.joiner.nickname}</p>
+                      </div>
+                      {teammatesInfo.joiner.qq_number && (
+                        <button
+                          onClick={() => copyQQ(teammatesInfo.joiner.qq_number)}
+                          className="p-2 bg-white rounded-xl shadow-sm hover:shadow-md transition-all text-pink-600"
+                          title="复制QQ"
+                        >
+                          <Copy size={18} />
+                        </button>
+                      )}
+                    </div>
+                    {teammatesInfo.joiner.qq_number && (
+                      <p className="text-sm text-slate-600 mt-2">QQ: {teammatesInfo.joiner.qq_number}</p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <button
+                onClick={() => setShowTeammatesModal(false)}
+                className="w-full py-3 mt-6 bg-green-600 text-white font-bold rounded-xl hover:bg-green-700 transition-all"
               >
                 知道了
               </button>
