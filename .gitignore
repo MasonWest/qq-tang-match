@@ -1,4 +1,4 @@
-# Dependencies
+﻿# Dependencies
 node_modules/
 .pnp
 .pnp.js
@@ -47,5 +47,11 @@ coverage/
 *.lcov
 
 # Project specific files
-项目说明.txt
 template.js
+项目说明.txt
+prompt更新.txt
+豆包api示例.txt
+等级表.xlsx
+改版.js
+migration-sql.txt
+new_rls_policies.txt
