@@ -2,11 +2,12 @@
 import { User, Clock, Users, PlusCircle, CheckCircle2, Trophy, Ghost, Sparkles, Lock, Copy, X } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { supabase, ensureAnonymousAuth } from './supabaseClient';
+import PrivacyUpgradeModal from '../PrivacyUpgradeModal.jsx';
 
 // --- 豆包API配置 ---
 const DOUBAO_API_URL = 'https://ark.cn-beijing.volces.com/api/v3/chat/completions';
 const DOUBAO_API_KEY = import.meta.env.VITE_DOUBAO_API_KEY;
-const DOUBAO_MODEL = 'doubao1-seed-2-0-pro-260215';
+const DOUBAO_MODEL = 'doubao-seed-2-0-pro-260215';
 
 // 生成队名函数
 const generateTeamName = async (nickname1, nickname2) => {
@@ -179,6 +180,10 @@ const App = () => {
   const [acceptStrangers, setAcceptStrangers] = useState(false); // 是否接受陌生人组队
   const [selectedModes, setSelectedModes] = useState(['football']); // 默认勾选足球
   const [reservations, setReservations] = useState([]);
+  const [myActiveApplications, setMyActiveApplications] = useState({});
+  const [myOwnedOpenTeams, setMyOwnedOpenTeams] = useState({});
+  const [myTeamIds, setMyTeamIds] = useState({});
+  const [preferredNickname, setPreferredNickname] = useState('');
   const [loading, setLoading] = useState(true);
   const [currentUserId, setCurrentUserId] = useState(null); // 当前用户ID
 
@@ -201,6 +206,39 @@ const App = () => {
   const [showTeammatesModal, setShowTeammatesModal] = useState(false);
   const [teammatesInfo, setTeammatesInfo] = useState(null);
 
+  // 隐私升级弹窗状态
+  const [isPrivacyModalOpen, setIsPrivacyModalOpen] = useState(false);
+
+  // 申请列表弹窗（发布者）
+  const [showApplicationsModal, setShowApplicationsModal] = useState(false);
+  const [applicationsList, setApplicationsList] = useState([]);
+  const [applicationsTeam, setApplicationsTeam] = useState(null);
+  const [acceptingApplicationId, setAcceptingApplicationId] = useState(null);
+
+  // 取消申请确认弹窗
+  const [cancelTargetTeamId, setCancelTargetTeamId] = useState(null);
+  const [cancelPublishTeam, setCancelPublishTeam] = useState(null);
+
+  // 站内提示
+  const [inlineNotice, setInlineNotice] = useState(null);
+
+  const getNicknameStorageKey = (uid) => `preferred_nickname:${uid}`;
+  const getLevelStorageKey = (uid) => `preferred_level:${uid}`;
+
+  const rememberNickname = (rawName, uid = currentUserId) => {
+    const value = (rawName || '').trim();
+    if (!uid || !value) return;
+    localStorage.setItem(getNicknameStorageKey(uid), value);
+    setPreferredNickname(value);
+  };
+
+  const rememberLevel = (rawLevel, uid = currentUserId) => {
+    const value = Number(rawLevel);
+    if (!uid || Number.isNaN(value)) return;
+    localStorage.setItem(getLevelStorageKey(uid), String(value));
+    setSelectedLevel(value);
+  };
+
   // 拖拽相关
   const trackRef = useRef(null);
   const [dragging, setDragging] = useState(null); // 'start' or 'end'
@@ -217,16 +255,92 @@ const App = () => {
     setLoading(false);
   };
 
+  // 获取当前用户的 active 申请（team_id -> application_id）
+  const fetchMyActiveApplications = async () => {
+    const { data, error } = await supabase
+      .from('applications')
+      .select('id, team_id')
+      .eq('status', 'active');
+
+    if (error) {
+      console.error('获取我的申请列表失败:', error);
+      return {};
+    }
+
+    const mapped = {};
+    (data || []).forEach((item) => {
+      mapped[item.team_id] = item.id;
+    });
+    setMyActiveApplications(mapped);
+    return mapped;
+  };
+
+  // 获取当前用户发布且仍 open 的队伍（team_id -> true）
+  const fetchMyOwnedOpenTeams = async () => {
+    const { data, error } = await supabase
+      .from('team_members')
+      .select('team_id, teams!inner(status)')
+      .eq('is_owner', true)
+      .eq('teams.status', 'open');
+
+    if (error) {
+      console.error('获取我发布的队伍失败:', error);
+      return {};
+    }
+
+    const mapped = {};
+    (data || []).forEach((item) => {
+      mapped[item.team_id] = true;
+    });
+    setMyOwnedOpenTeams(mapped);
+    return mapped;
+  };
+
+  // 获取当前用户已参与的所有队伍（用于 matched 可见性）
+  const fetchMyTeamIds = async () => {
+    const { data, error } = await supabase
+      .from('team_members')
+      .select('team_id');
+
+    if (error) {
+      console.error('获取我的队伍列表失败:', error);
+      return {};
+    }
+
+    const mapped = {};
+    (data || []).forEach((item) => {
+      mapped[item.team_id] = true;
+    });
+    setMyTeamIds(mapped);
+    return mapped;
+  };
+
   // 初始化加载（移除实时订阅，通过刷新获取更新）
   useEffect(() => {
     ensureAnonymousAuth().then(async () => {
       const { data: { user } } = await supabase.auth.getUser();
       if (user) {
         setCurrentUserId(user.id);
+        const savedNickname = localStorage.getItem(getNicknameStorageKey(user.id)) || '';
+        if (savedNickname) {
+          setPreferredNickname(savedNickname);
+          setNickname(savedNickname);
+          setJoinNickname(savedNickname);
+        }
+        const savedLevel = parseInt(localStorage.getItem(getLevelStorageKey(user.id)) || '', 10);
+        if (!Number.isNaN(savedLevel) && savedLevel >= 1 && savedLevel <= 30) {
+          setSelectedLevel(savedLevel);
+        }
       }
-      fetchReservations();
+      await Promise.all([fetchReservations(), fetchMyActiveApplications(), fetchMyOwnedOpenTeams(), fetchMyTeamIds()]);
     });
   }, [selectedDate]);
+
+  useEffect(() => {
+    if (!inlineNotice) return;
+    const timer = setTimeout(() => setInlineNotice(null), 2400);
+    return () => clearTimeout(timer);
+  }, [inlineNotice]);
 
   const handleMouseDown = (type) => (e) => {
     e.preventDefault();
@@ -274,6 +388,11 @@ const App = () => {
   const handleSubmit = async (e) => {
     e.preventDefault();
     if (!nickname.trim()) return;
+
+    if (Object.keys(myActiveApplications).length > 0) {
+      alert('您有未取消的申请，需先取消后才能发布预约');
+      return;
+    }
 
     // 频率限制：10秒内只能提交一次
     const lastSubmit = localStorage.getItem('lastSubmitTime');
@@ -361,6 +480,8 @@ const App = () => {
 
     const teamId = teamData[0].id;
     const { data: { user } } = await supabase.auth.getUser();
+    rememberNickname(nickname.trim(), user?.id || currentUserId);
+    rememberLevel(selectedLevel, user?.id || currentUserId);
 
     const { error: memberError } = await supabase
       .from('team_members')
@@ -389,6 +510,7 @@ const App = () => {
       game_modes: selectedModes,
       accept_strangers: acceptStrangers,
       status: 'open',
+      application_count: 0,
       team_name: null,
       creator_nickname: nickname.trim(),
       creator_qq: qqNumber.trim() || null,
@@ -412,13 +534,15 @@ const App = () => {
     }
 
     // 重置表单
-    setNickname('');
-    setSelectedLevel(1);
+    setNickname(nickname.trim());
+    setJoinNickname(nickname.trim());
     setAcceptStrangers(false);
     setSelectedModes(['football']);
     setQQNumber('');
     setShowQQModal(false);
     setPendingSubmit(false);
+    await fetchMyOwnedOpenTeams();
+    await fetchMyTeamIds();
   };
 
   // 取消提交
@@ -430,7 +554,7 @@ const App = () => {
 
   const handleJoin = async (player) => {
     // 频率限制：10秒内只能操作一次
-    const lastJoin = localStorage.getItem('lastJoinTime');
+    const lastJoin = localStorage.getItem('lastApplicationActionTime');
     const COOLDOWN = 10000;
     if (lastJoin && Date.now() - parseInt(lastJoin) < COOLDOWN) {
       const remaining = Math.ceil((COOLDOWN - (Date.now() - parseInt(lastJoin))) / 1000);
@@ -438,12 +562,21 @@ const App = () => {
       return;
     }
 
+    if (Object.keys(myOwnedOpenTeams).length > 0 && !myOwnedOpenTeams[player.id]) {
+      alert('您当前有进行中的发布，请先取消发布后再申请其他房间');
+      return;
+    }
+
     // 打开加入弹窗
+    if (!joinNickname.trim()) {
+      const fallbackName = preferredNickname || nickname || '';
+      if (fallbackName) setJoinNickname(fallbackName);
+    }
     setJoiningPlayer(player);
     setShowJoinModal(true);
   };
 
-  // 确认加入
+  // 确认申请
   const confirmJoin = async () => {
     if (!joinNickname.trim()) {
       alert('请输入您的昵称');
@@ -456,6 +589,11 @@ const App = () => {
     }
 
     if (!joiningPlayer) return;
+
+    if (Object.keys(myOwnedOpenTeams).length > 0 && !myOwnedOpenTeams[joiningPlayer.id]) {
+      alert('您当前有进行中的发布，请先取消发布后再申请其他房间');
+      return;
+    }
 
     const trimmedJoinNickname = joinNickname.trim();
     const trimmedJoinQQNumber = joinQQNumber.trim();
@@ -472,127 +610,211 @@ const App = () => {
       }
     }
 
-    // 检查当前用户是否已在当天发布或加入过队伍
-    const { data: existingMember, error: checkError } = await supabase
-      .from('team_members')
-      .select('team_id, teams!inner(date)')
-      .eq('user_id', userId)
-      .eq('teams.date', selectedDate)
-      .limit(1);
-
-    if (checkError) {
-      console.error('检查重复加入失败:', checkError);
-      alert('检查加入状态失败，请重试');
-      return;
-    }
-
-    if (existingMember && existingMember.length > 0) {
-      alert('您今天已经发布或加入过队伍了，排位每天只能固定一个队友');
-      return;
-    }
-
-    // 先插入 team_member（这样才有权限 update teams）
     try {
-      const { data: { user: joinUser } } = await supabase.auth.getUser();
+      rememberNickname(trimmedJoinNickname, userId);
+      setNickname(trimmedJoinNickname);
+      const { error } = await supabase.rpc('create_application', {
+        p_team_id: joiningPlayer.id,
+        p_applicant_nickname: trimmedJoinNickname,
+        p_applicant_qq: trimmedJoinQQNumber || null
+      });
 
-      const { error: memberError } = await supabase
-        .from('team_members')
-        .insert([{
-          team_id: joiningPlayer.id,
-          user_id: joinUser.id,
-          nickname: trimmedJoinNickname,
-          qq_number: trimmedJoinQQNumber || null,
-          is_owner: false
-        }]);
-
-      if (memberError) {
-        console.error('队员插入失败:', memberError);
-        alert('加入失败：' + memberError.message);
+      if (error) {
+        console.error('提交申请失败:', error);
+        if (error.message?.includes('ACTIVE_APPLICATION_LIMIT_REACHED')) {
+          alert('您最多只能同时申请 3 个房间');
+        } else if (error.message?.includes('ALREADY_PARTICIPATED_ON_DATE')) {
+          alert('您今天已经参与过组队，不能再申请其他房间');
+        } else if (error.message?.includes('OWNER_HAS_OPEN_TEAM_CANNOT_APPLY')) {
+          alert('您当前有进行中的发布，请先取消发布后再申请其他房间');
+        } else if (error.message?.includes('DUPLICATE_ACTIVE_APPLICATION')) {
+          alert('您已经申请过这个房间了');
+        } else if (error.message?.includes('TEAM_NOT_OPEN')) {
+          alert('该房间已不可申请，请刷新列表');
+        } else {
+          alert('申请失败：' + error.message);
+        }
         return;
       }
 
-      // 成为成员后再更新 team 状态和加入者信息
-      const { error: teamError } = await supabase
-        .from('teams')
-        .update({
-          status: 'matched',
-          joiner_nickname: trimmedJoinNickname,
-          joiner_qq_number: trimmedJoinQQNumber || null
-        })
-        .eq('id', joiningPlayer.id);
-
-      if (teamError) {
-        console.error('数据库更新失败:', teamError);
-        alert('加入失败：' + teamError.message);
-        return;
-      }
-
-      console.log('加入成功');
-      localStorage.setItem('lastJoinTime', Date.now().toString());
-
-      // 记录用户加入的队伍 ID
-      const userTeams = JSON.parse(localStorage.getItem('userTeams') || '[]');
-      if (!userTeams.includes(joiningPlayer.id)) {
-        userTeams.push(joiningPlayer.id);
-        localStorage.setItem('userTeams', JSON.stringify(userTeams));
-      }
+      localStorage.setItem('lastApplicationActionTime', Date.now().toString());
 
       // 关闭加入弹窗
       setShowJoinModal(false);
       setJoinNickname('');
-      setJoinQQNumber(''); // 清空加入者QQ号码
-
-      // 重新从数据库获取最新数据（只查 teams，不 join team_members）
-      const { data: updatedTeam } = await supabase
-        .from('teams')
-        .select('*')
-        .eq('id', joiningPlayer.id)
-        .single();
-
-      if (updatedTeam) {
-        // 更新本地列表中的该队伍数据
-        setReservations(prev =>
-          prev.map(p =>
-            p.id === joiningPlayer.id ? updatedTeam : p
-          )
-        );
-
-        const ownerNickname = updatedTeam.creator_nickname;
-        const ownerQQ = updatedTeam.creator_qq;
-
-        // 如果发布者留下了QQ，显示查看联系方式弹窗
-        if (ownerQQ) {
-          setContactInfo({
-            qq: ownerQQ,
-            nickname: ownerNickname
-          });
-          setShowContactModal(true);
-        }
-
-        // 异步生成队名（不阻塞）
-        generateTeamName(ownerNickname, trimmedJoinNickname).then(async (teamName) => {
-          console.log('生成的队名:', teamName);
-          // 更新队名到数据库
-          await supabase
-            .from('teams')
-            .update({ team_name: teamName })
-            .eq('id', joiningPlayer.id);
-          // 本地更新队名
-          setReservations(prev =>
-            prev.map(p =>
-              p.id === joiningPlayer.id ? { ...p, team_name: teamName } : p
-            )
-          );
-        }).catch(err => {
-          console.error('生成队名失败:', err);
-        });
-      }
+      setJoinQQNumber('');
 
       setJoiningPlayer(null);
+      await fetchReservations();
+      const updatedMap = await fetchMyActiveApplications();
+      await fetchMyOwnedOpenTeams();
+      await fetchMyTeamIds();
+      const remainingSlots = Math.max(0, 3 - Object.keys(updatedMap || {}).length);
+      setInlineNotice({
+        title: '申请已提交',
+        subtitle: `您还可以申请 ${remainingSlots} 个预约`,
+        tone: 'success'
+      });
     } catch (err) {
       console.error('数据库操作异常:', err);
-      alert('加入失败，请检查网络');
+      alert('申请失败，请检查网络');
     }
+  };
+
+  // 取消申请
+  const cancelApplication = async (teamId) => {
+    const lastAction = localStorage.getItem('lastApplicationActionTime');
+    const COOLDOWN = 10000;
+    if (lastAction && Date.now() - parseInt(lastAction) < COOLDOWN) {
+      const remaining = Math.ceil((COOLDOWN - (Date.now() - parseInt(lastAction))) / 1000);
+      alert(`操作太频繁，请 ${remaining} 秒后再试`);
+      return;
+    }
+
+    const applicationId = myActiveApplications[teamId];
+    if (!applicationId) {
+      alert('未找到可取消的申请，请刷新后重试');
+      return;
+    }
+
+    const { error } = await supabase.rpc('cancel_application', {
+      p_application_id: applicationId
+    });
+
+    if (error) {
+      console.error('取消申请失败:', error);
+      alert('取消申请失败：' + error.message);
+      return;
+    }
+
+    localStorage.setItem('lastApplicationActionTime', Date.now().toString());
+    await fetchReservations();
+    const updatedMap = await fetchMyActiveApplications();
+    await fetchMyOwnedOpenTeams();
+    await fetchMyTeamIds();
+    const remainingSlots = Math.max(0, 3 - Object.keys(updatedMap || {}).length);
+    setInlineNotice({
+      title: '申请已取消',
+      subtitle: `您还可以申请 ${remainingSlots} 个预约`,
+      tone: 'info'
+    });
+  };
+
+  const requestCancelApplication = (teamId) => {
+    setCancelTargetTeamId(teamId);
+  };
+
+  const confirmCancelApplication = async () => {
+    if (!cancelTargetTeamId) return;
+    const teamId = cancelTargetTeamId;
+    setCancelTargetTeamId(null);
+    await cancelApplication(teamId);
+  };
+
+  const requestCancelPublish = (team) => {
+    setCancelPublishTeam(team);
+  };
+
+  const confirmCancelPublish = async () => {
+    if (!cancelPublishTeam?.id) return;
+    const team = cancelPublishTeam;
+    setCancelPublishTeam(null);
+
+    const { error } = await supabase.rpc('delete_open_team', {
+      p_team_id: team.id
+    });
+
+    if (error) {
+      console.error('取消发布失败:', error);
+      alert('取消发布失败：' + error.message);
+      return;
+    }
+
+    await fetchReservations();
+    await fetchMyActiveApplications();
+    await fetchMyOwnedOpenTeams();
+    await fetchMyTeamIds();
+    setInlineNotice({
+      title: '发布已取消',
+      subtitle: '该房间已从列表移除',
+      tone: 'info'
+    });
+  };
+
+  // 发布者查看申请列表
+  const viewApplications = async (team) => {
+    const { data, error } = await supabase.rpc('list_team_active_applications', {
+      p_team_id: team.id
+    });
+
+    if (error) {
+      console.error('获取申请列表失败:', error);
+      alert('获取申请列表失败：' + error.message);
+      return;
+    }
+
+    setApplicationsTeam(team);
+    setApplicationsList(data || []);
+    setShowApplicationsModal(true);
+  };
+
+  // 发布者接受申请 -> 房间变 matched
+  const acceptApplication = async (application) => {
+    if (!application?.id || !applicationsTeam?.id) return;
+
+    setAcceptingApplicationId(application.id);
+    const { data, error } = await supabase.rpc('accept_application', {
+      p_application_id: application.id
+    });
+    setAcceptingApplicationId(null);
+
+    if (error) {
+      console.error('接受申请失败:', error);
+      if (error.message?.includes('APPLICANT_ALREADY_PARTICIPATED_ON_DATE')) {
+        alert('该申请人今天已参与其他组队，无法接受该申请');
+      } else {
+        alert('接受申请失败：' + error.message);
+      }
+      await fetchReservations();
+      if (applicationsTeam) {
+        await viewApplications(applicationsTeam);
+      }
+      return;
+    }
+
+    const acceptedTeamId = data?.[0]?.team_id || applicationsTeam.id;
+    const acceptedNickname = data?.[0]?.joiner_nickname || application.applicant_nickname || '该玩家';
+
+    // 记录为我的队伍，确保 matched 可见
+    const userTeams = JSON.parse(localStorage.getItem('userTeams') || '[]');
+    if (!userTeams.includes(acceptedTeamId)) {
+      userTeams.push(acceptedTeamId);
+      localStorage.setItem('userTeams', JSON.stringify(userTeams));
+    }
+
+    // 异步生成队名
+    try {
+      const teamName = await generateTeamName(applicationsTeam.creator_nickname || '队长', acceptedNickname);
+      await supabase
+        .from('teams')
+        .update({ team_name: teamName })
+        .eq('id', acceptedTeamId);
+    } catch (err) {
+      console.error('接受后生成队名失败:', err);
+    }
+
+    setShowApplicationsModal(false);
+    setApplicationsList([]);
+    setApplicationsTeam(null);
+    await fetchReservations();
+    await fetchMyActiveApplications();
+    await fetchMyOwnedOpenTeams();
+    await fetchMyTeamIds();
+    setInlineNotice({
+      title: `已接受 ${acceptedNickname} 的申请`,
+      subtitle: '队伍已匹配成功',
+      tone: 'success'
+    });
   };
 
   // 取消加入
@@ -642,6 +864,40 @@ const App = () => {
       <div className="h-80 w-full bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-500 absolute top-0 left-0" />
 
       <div className="relative z-10 max-w-5xl mx-auto px-3 sm:px-4 pt-8 sm:pt-12">
+        <div className="flex justify-end mb-3 sm:mb-4">
+          <button
+            type="button"
+            onClick={() => setIsPrivacyModalOpen(true)}
+            className="inline-flex items-center gap-1.5 sm:gap-2 bg-white/20 backdrop-blur-xl px-3 sm:px-4 py-1.5 sm:py-2 rounded-full border border-white/30 text-white text-xs sm:text-sm font-bold hover:bg-white/30 transition-all"
+          >
+            <Lock size={12} className="sm:hidden" />
+            <Lock size={14} className="hidden sm:block" />
+            隐私保护已升级
+          </button>
+        </div>
+
+        <AnimatePresence>
+          {inlineNotice && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -10 }}
+              className="mb-3 sm:mb-4"
+            >
+              <div className={`rounded-2xl px-4 sm:px-5 py-3 shadow-lg border ${
+                inlineNotice.tone === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                  : 'bg-indigo-50 border-indigo-200 text-indigo-800'
+              }`}>
+                <p className="text-sm sm:text-base font-black">{inlineNotice.title}</p>
+                {inlineNotice.subtitle && (
+                  <p className="text-[11px] sm:text-xs font-medium opacity-80 mt-0.5">{inlineNotice.subtitle}</p>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Header */}
         <header className="text-center mb-6 sm:mb-10">
           <motion.div
@@ -682,7 +938,11 @@ const App = () => {
                       type="text"
                       placeholder="输入你的游戏ID..."
                       value={nickname}
-                      onChange={(e) => setNickname(e.target.value)}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setNickname(v);
+                        if (v.trim()) rememberNickname(v);
+                      }}
                       className="w-full px-4 sm:px-6 py-3 sm:py-4 bg-slate-50 border-2 border-slate-100 rounded-xl sm:rounded-2xl focus:border-purple-400 focus:bg-white transition-all outline-none text-lg sm:text-xl font-bold"
                     />
                   </div>
@@ -692,7 +952,7 @@ const App = () => {
                     </label>
                     <select
                       value={selectedLevel}
-                      onChange={(e) => setSelectedLevel(parseInt(e.target.value))}
+                      onChange={(e) => rememberLevel(parseInt(e.target.value, 10))}
                       className="w-full px-4 sm:px-6 py-3 sm:py-4 bg-slate-50 border-2 border-slate-100 rounded-xl sm:rounded-2xl focus:border-purple-400 focus:bg-white transition-all outline-none text-sm sm:text-base font-bold appearance-none cursor-pointer"
                       style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%2394a3b8'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 1rem center', backgroundSize: '1.5rem' }}
                     >
@@ -896,17 +1156,17 @@ const App = () => {
                     if (player.status === 'open') return true;
                     // matched 队伍：只有 creator 或成员可见
                     if (player.status === 'matched') {
-                      // 判断是否是 creator（通过 creator_nickname 对比不够准确，用 currentUserId 判断成员身份）
-                      // 这里需要调用 RPC 或检查 team_members，但 RLS 限制了查询
-                      // 简化方案：前端通过 local storage 记录用户创建/加入的队伍 ID
                       const userTeams = JSON.parse(localStorage.getItem('userTeams') || '[]');
-                      return userTeams.includes(player.id);
+                      return Boolean(myTeamIds[player.id]) || userTeams.includes(player.id);
                     }
                     return false;
                   })
                   .map((player) => {
                   const creatorName = player.creator_nickname || '未知';
                   const isMatched = player.status === 'matched';
+                  const applicationCount = Number(player.application_count || 0);
+                  const isOwner = Boolean(myOwnedOpenTeams[player.id]);
+                  const hasApplied = Boolean(myActiveApplications[player.id]);
 
                   return (
                   <motion.div
@@ -969,6 +1229,16 @@ const App = () => {
                           {isMatched ? '已匹配' : '等待加入...'}
                         </span>
                       </div>
+                      {!isMatched && (
+                        applicationCount > 0 ? (
+                          <div className="flex items-center gap-1.5 sm:gap-2">
+                            <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-amber-400" />
+                            <span className="text-[10px] sm:text-xs font-bold text-amber-600">
+                              当前 {applicationCount} 人申请中
+                            </span>
+                          </div>
+                        ) : null
+                      )}
                       {/* 显示是否接受陌生人 */}
                       {player.accept_strangers ? (
                         <div className="flex items-center gap-1.5 sm:gap-2">
@@ -1012,12 +1282,37 @@ const App = () => {
                           查看队友
                         </button>
                       </div>
+                    ) : isOwner ? (
+                      <div className="space-y-2">
+                        <button
+                          onClick={() => viewApplications(player)}
+                          className="w-full bg-amber-50 text-amber-700 font-black py-2 sm:py-3 rounded-xl sm:rounded-2xl hover:bg-amber-500 hover:text-white transition-all flex items-center justify-center gap-1.5 sm:gap-2 group text-sm sm:text-base"
+                        >
+                          查看申请列表
+                          <div className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-amber-400 rounded-full group-hover:bg-white animate-bounce" />
+                        </button>
+                        <button
+                          onClick={() => requestCancelPublish(player)}
+                          className="w-full bg-slate-100 text-slate-700 font-black py-2 sm:py-3 rounded-xl sm:rounded-2xl hover:bg-slate-700 hover:text-white transition-all flex items-center justify-center gap-1.5 sm:gap-2 group text-sm sm:text-base"
+                        >
+                          取消发布
+                          <div className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-slate-400 rounded-full group-hover:bg-white animate-bounce" />
+                        </button>
+                      </div>
+                    ) : hasApplied ? (
+                      <button
+                        onClick={() => requestCancelApplication(player.id)}
+                        className="w-full bg-rose-50 text-rose-600 font-black py-2 sm:py-3 rounded-xl sm:rounded-2xl hover:bg-rose-600 hover:text-white transition-all flex items-center justify-center gap-1.5 sm:gap-2 group text-sm sm:text-base"
+                      >
+                        取消申请
+                        <div className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-rose-400 rounded-full group-hover:bg-white animate-bounce" />
+                      </button>
                     ) : (
                       <button
                         onClick={() => handleJoin(player)}
                         className="w-full bg-indigo-50 text-indigo-600 font-black py-2 sm:py-3 rounded-xl sm:rounded-2xl hover:bg-indigo-600 hover:text-white transition-all flex items-center justify-center gap-1.5 sm:gap-2 group text-sm sm:text-base"
                       >
-                        加入对战
+                        申请加入
                         <div className="w-1 h-1 sm:w-1.5 sm:h-1.5 bg-indigo-400 rounded-full group-hover:bg-white animate-bounce" />
                       </button>
                     )}
@@ -1127,10 +1422,10 @@ const App = () => {
                   <Users size={32} className="text-indigo-600" />
                 </div>
                 <h3 className="text-xl font-black text-slate-800 mb-2">
-                  加入队伍
+                  申请加入队伍
                 </h3>
                 <p className="text-sm text-slate-500">
-                  您即将加入 <span className="font-bold text-indigo-600">{joiningPlayer.creator_nickname || '未知'}</span> 的队伍
+                  您正在申请 <span className="font-bold text-indigo-600">{joiningPlayer.creator_nickname || '未知'}</span> 的队伍
                 </p>
               </div>
 
@@ -1143,7 +1438,14 @@ const App = () => {
                     type="text"
                     placeholder="输入您的游戏ID..."
                     value={joinNickname}
-                    onChange={(e) => setJoinNickname(e.target.value)}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      setJoinNickname(v);
+                      if (v.trim()) {
+                        rememberNickname(v);
+                        setNickname(v);
+                      }
+                    }}
                     className="w-full px-4 py-3 bg-slate-50 border-2 border-slate-200 rounded-xl focus:border-indigo-500 focus:bg-white transition-all outline-none text-lg font-bold"
                     autoFocus
                   />
@@ -1189,10 +1491,161 @@ const App = () => {
                     onClick={confirmJoin}
                     className="flex-1 py-3 px-4 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-all"
                   >
-                    确认加入
+                    确认申请
                   </button>
                 </div>
               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 取消申请确认弹窗 */}
+      <AnimatePresence>
+        {cancelTargetTeamId && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setCancelTargetTeamId(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-lg sm:text-xl font-black text-slate-800 mb-2">确认取消申请？</h3>
+              <p className="text-sm text-slate-500 mb-6">取消后该队伍将不再保留您的申请名额。</p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setCancelTargetTeamId(null)}
+                  className="flex-1 py-3 px-4 bg-slate-100 text-slate-700 font-bold rounded-xl hover:bg-slate-200 transition-all"
+                >
+                  先不取消
+                </button>
+                <button
+                  onClick={confirmCancelApplication}
+                  className="flex-1 py-3 px-4 bg-rose-600 text-white font-bold rounded-xl hover:bg-rose-700 transition-all"
+                >
+                  确认取消
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 取消发布确认弹窗 */}
+      <AnimatePresence>
+        {cancelPublishTeam && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setCancelPublishTeam(null)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl p-6 sm:p-8 max-w-md w-full shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="text-lg sm:text-xl font-black text-slate-800 mb-2">确认取消发布？</h3>
+              <p className="text-sm text-slate-500 mb-6">
+                取消后该房间会被直接删除，相关申请也会一并清除。
+              </p>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setCancelPublishTeam(null)}
+                  className="flex-1 py-3 px-4 bg-slate-100 text-slate-700 font-bold rounded-xl hover:bg-slate-200 transition-all"
+                >
+                  先保留
+                </button>
+                <button
+                  onClick={confirmCancelPublish}
+                  className="flex-1 py-3 px-4 bg-slate-800 text-white font-bold rounded-xl hover:bg-black transition-all"
+                >
+                  确认删除
+                </button>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* 发布者查看申请列表弹窗 */}
+      <AnimatePresence>
+        {showApplicationsModal && applicationsTeam && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setShowApplicationsModal(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="bg-white rounded-3xl p-6 sm:p-8 max-w-xl w-full shadow-2xl max-h-[80vh] overflow-y-auto"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between mb-5">
+                <div>
+                  <h3 className="text-lg sm:text-xl font-black text-slate-800">申请列表</h3>
+                  <p className="text-xs sm:text-sm text-slate-500 mt-1">
+                    {applicationsTeam.creator_nickname || '您'} 的房间，当前 {applicationsList.length} 人申请中
+                  </p>
+                </div>
+                <button
+                  onClick={() => setShowApplicationsModal(false)}
+                  className="p-2 hover:bg-slate-100 rounded-full transition-all"
+                >
+                  <X size={20} className="text-slate-400" />
+                </button>
+              </div>
+
+              {applicationsList.length === 0 ? (
+                <div className="text-center py-10 bg-slate-50 rounded-2xl border border-slate-100">
+                  <p className="text-sm text-slate-500 font-medium">暂时还没有人申请</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {applicationsList.map((app) => (
+                    <div key={app.id} className="bg-slate-50 rounded-2xl p-4 border border-slate-100">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-base font-black text-slate-800">{app.applicant_nickname || '未知玩家'}</p>
+                          <p className="text-xs text-slate-500 mt-1">
+                            申请时间：{new Date(app.created_at).toLocaleString()}
+                          </p>
+                          {app.applicant_qq ? (
+                            <p className="text-sm text-slate-700 mt-2">QQ：{app.applicant_qq}</p>
+                          ) : (
+                            <p className="text-xs text-slate-400 mt-2">未填写 QQ</p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => acceptApplication(app)}
+                          disabled={acceptingApplicationId === app.id}
+                          className={`shrink-0 py-2 px-3 rounded-lg text-xs sm:text-sm font-bold transition-all ${
+                            acceptingApplicationId === app.id
+                              ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                              : 'bg-emerald-600 text-white hover:bg-emerald-700'
+                          }`}
+                        >
+                          {acceptingApplicationId === app.id ? '处理中...' : '接受申请'}
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </motion.div>
           </motion.div>
         )}
@@ -1349,6 +1802,12 @@ const App = () => {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* 隐私保护升级弹窗 */}
+      <PrivacyUpgradeModal 
+        isOpen={isPrivacyModalOpen} 
+        onClose={() => setIsPrivacyModalOpen(false)} 
+      />
     </div>
   );
 };
